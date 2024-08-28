@@ -1,0 +1,846 @@
+import re
+import sys
+import time
+
+from node_hardening.parsers import PropertiesOutputParser, \
+    ServicesStatusesParser, TwoColumnsKeyValueSumOutputParser, \
+    KeyValuesListOutputParser, NetstatTulpnOutputParser, \
+    CrontabJobsPerUserParser, NTPOutputParser, RealUsersParser
+from node_hardening.section import CommandExecutionException
+
+from node_hardening.basehardening import section_topic, BaseNodeHardening, \
+                                         StopHardeningExecution
+from node_hardening.report import Table
+
+
+class NodeHardening(BaseNodeHardening):
+    """ This class contains all the section methods to be executed during
+    the node hardening process. Every method decorated by "section" must
+    specify which Section and Topic (section attribute) of a node hardening
+    description. The "ssh" connection and the "expected_value" for the topic
+    will be passed as arguments.
+    """
+
+    @section_topic("OsInstallation", "packages", just_report=True)
+    def os_installation_packages(self, ssh, expected_value):
+        """ Checks OS installation, that includes:
+         1. Necessary packages;
+         2. Unnecessary packages;
+        """
+        # 1 and 2. check un/necessary packages
+        out = ssh.run('/bin/rpm -qa')
+        #existing_packages = set(out.splitlines())
+        #expected_packages = set(expected_value)
+        #missing_packages = expected_packages - existing_packages
+        #unnecessary_packages = existing_packages - expected_packages
+        #report = dict()
+        # 1 report necessary packages
+        #if missing_packages:
+        #    report['Missing Packages'] = list(missing_packages)
+
+        # 2. report unnecessary packages
+        #if unnecessary_packages:
+        #    report['Unnecessary Packages'] = list(unnecessary_packages)
+
+        #if not missing_packages and not unnecessary_packages:
+        #    report['Packages'] = "All packages are installed and there's
+        #                         "no unnecessary packages installed too."
+        return {'Installed Packages': out.splitlines()}
+
+    @section_topic("OsInstallation", "selinux_enabled")
+    def os_installation_selinux_enabled(self, ssh, should_be_enabled):
+        """ Checks OS installation, Whether SELinux is enabled or not.
+        """
+        out = ssh.run('/usr/sbin/sestatus')
+        parser = PropertiesOutputParser(out)
+        status = parser.parse()['SELinux status']
+        report = dict(status=status)
+        is_enabled = status == 'enabled'
+
+        if should_be_enabled and not is_enabled:
+            # can't do it without reboot
+            raise StopHardeningExecution("SELinux should be enabled but it's "
+                                         "not.")
+        elif not should_be_enabled and is_enabled:
+            raise StopHardeningExecution("The case of disabling selinux must "
+                                         "be implemented.")
+        return report
+
+    @section_topic("OsInstallation", "selinux_enforced")
+    def os_installation_selinux_enforced(self, ssh, should_be_enforced):
+        """ Checks OS installation, Whether SELinux is enforced or not.
+        """
+        out = ssh.run('/usr/sbin/sestatus')
+        parser = PropertiesOutputParser(out)
+        data = parser.parse()
+        # check for enforcing
+        mode = data.get('Current mode')
+        is_enforced = mode == 'enforcing'
+        report = dict(enforced_status=mode)
+        if should_be_enforced and not is_enforced:
+            # turn it on here
+            ssh.run('echo 1 >/selinux/enforce')
+        elif not should_be_enforced and is_enforced:
+            # turn it off here
+            ssh.run('echo 0 >/selinux/enforce')
+        return report
+
+    @section_topic("TimeSynchronisation", "ntp_sync_enabled")
+    def check_time_synchronisation(self, ssh, should_be_enabled):
+        """Checks Time Synchronisation to ensure:
+        1. Peers servers are in sync with MS
+        """
+        report = dict()
+        # check peer nodes are syncing (NTP) to the MS
+        if should_be_enabled:
+            cmd = '/usr/sbin/ntpq -p'
+            out = ssh.run(cmd)
+            parser = NTPOutputParser(out)
+            actual_address = parser.parse()
+            report['ntp_is_enabled'] = should_be_enabled
+            if not actual_address:
+                raise StopHardeningExecution("Unable to determine the "
+                                             "address of the ntp server")
+            report['ntp_server_address'] = actual_address
+            if self.description.ntp_server != actual_address:
+                raise StopHardeningExecution("Peer server should be trying to " \
+                      "sync with the MS but it is instead trying to sync " \
+                      "with IP address " \
+                      "%s." % actual_address)
+        else:
+            raise StopHardeningExecution("ntp_sync_enabled False case must be "
+                                         "implemented")
+        return report
+
+    @section_topic("VirtualMachineHardening", "root_ssh_access")
+    def check_root_ssh_access(self, ssh, expected_root_ssh_access):
+        """ Check the root ssh access on the system and change if required
+        1. Check the current PermitRootLogin setting in the sshd_config file
+        2. Update the PermitRootLogin as required and restart sshd service
+        3. Generate report
+        """
+        cmd = "grep '^PermitRootLogin' /etc/ssh/sshd_config || echo 'Not Found'"
+        report = "Permit root login - Changed to No"
+        out = ssh.run(cmd)
+        if re.search('Not Found', out) and expected_root_ssh_access is False:
+            # Set Permit Root login to No and restart sshd service
+            ssh.run("echo 'PermitRootLogin no' >> /etc/ssh/sshd_config")
+            ssh.run("nohup /sbin/service sshd restart")
+        elif re.search('yes', out) and expected_root_ssh_access is False:
+            # Change Permit Root login to No and restart sshd service
+            ssh.run("sed -i.bkp 's/^PermitRootLogin yes/"
+                    "PermitRootLogin no/g' /etc/ssh/sshd_config")
+            ssh.run("nohup /sbin/service sshd restart")
+        elif re.search('no', out) and expected_root_ssh_access is True:
+            pass
+            # Change Permit Root login to Yes and restart sshd service
+            ssh.run("sed -i.bkp 's/^PermitRootLogin no/"
+                    "PermitRootLogin yes/g' /etc/ssh/sshd_config")
+            ssh.run("nohup /sbin/service sshd restart")
+            report = "Permit root login - Changed to Yes"
+        else:
+            report = "Permit root login - No changes require"
+        return report
+
+    @section_topic("LoginControl", "password_age")
+    def check_max_password_age(self, ssh, expected_password_age):
+        """ Check the password age for each user on the system
+        1. Get all users from the system
+        2. Check what is the current MAX password age for each user
+        3. Setup MAX password age for each user as specified in expected value
+        """
+        # Get all real system users from system
+        cmd = "cat /etc/passwd"
+        passwd = ssh.run(cmd)
+        parser = RealUsersParser(passwd)
+        all_users = parser.parse() + ['root']
+        # Check what is the current MAX password age for each user
+        report = {'Changed Users': []}
+        for user in all_users:
+            cmd = 'chage -l {0}'.format(user)
+            out = ssh.run(cmd)
+            parser = PropertiesOutputParser(out)
+            data = parser.parse()
+            max_age = data['Maximum number of days between password change']
+            # Configure MAX password age as for each user
+            #  as specified in description
+            if expected_password_age != int(max_age):
+                # We are updating the last password change to current day
+                # This is OK for the automatic scan but it SHOULD NOT be done
+                # for the real hardening product.
+                cmd = 'chage -d $(date +%Y-%m-%d) -M {0} {1}'.format(
+                    expected_password_age,
+                    user
+                )
+                ssh.run(cmd)
+                report['Changed Users'].append(user)
+        return report if report['Changed Users'] \
+                      else "No users have been changed."
+
+    @section_topic("LoginControl", "idle_timeout")
+    def check_login_session_timeout(self, ssh, expected_idle_timeout):
+        """ Ensure inactive login session is timeout after given number of sec
+        1. Check if file os-security.sh
+        2. If file don't exist created it with given timeout value
+        3. If file exist but with different value, update it.
+        """
+        filename = "/etc/profile.d/os-security.sh"
+        cmd = "cat {0} || echo 'No File'".format(filename)
+        out = ssh.run(cmd)
+        match = re.search(r'TMOUT=(\d+)', out)
+        if re.search('No File', out):
+            ssh.run("echo 'readonly TMOUT={0}' >> {1}".format(
+                expected_idle_timeout,
+                filename
+            ))
+            ssh.run("chmod +x {0}".format(filename))
+            report = "File {0} created with idle timeout: {1}".format(
+                filename,
+                expected_idle_timeout
+            )
+        elif match:
+            if int(match.group(1)) != expected_idle_timeout:
+                ssh.run("sed -i.bkp 's/{0}/{1}/g' {2}".format(
+                    match.group(1),
+                    expected_idle_timeout,
+                    filename
+                ))
+                report = "File {0} updated with idle timeout: {1}".format(
+                    filename,
+                    expected_idle_timeout
+                )
+            else:
+                report = "No changes required"
+        else:
+            raise StopHardeningExecution("Can't update file: {0} with "
+                                         "idle timeout {1}".format(
+                filename,
+                expected_idle_timeout
+            ))
+        return report
+
+    @section_topic("SecuringServices", "max_logins")
+    def check_max_login_shells(self, ssh, max_logins):
+        """ Ensure  max number of login shells per user is 10
+        1. Checks /etc/security/limits.conf to see if maxlogins is configured.
+        2. Set maxlogins in 10
+        """
+        report = dict()
+        limits_conf = "/etc/security/limits.conf"
+        try:
+            cmd = "/bin/grep -i maxlogins %s" % limits_conf
+            out = ssh.run(cmd)
+            for line in out.splitlines():
+                if line.startswith('#'):
+                    continue
+            # delete any previous settings if they exist
+                cmd = "/bin/sed -i '/%s/d' %s" % (line, limits_conf)
+                out = ssh.run(cmd)
+        except CommandExecutionException as error:
+            if error.status_code == 1:
+                report['Not found'] = "No previous settings found"
+        cmd = "/bin/echo '*         -           maxlogins       %s' >> %s" % (max_logins, limits_conf)
+        out = ssh.run(cmd)
+        report['max_logins'] = "File %s updated with maxlogins set to %s." % (limits_conf, max_logins)
+
+        return report
+
+    @section_topic("SystemAccessControl", "account_locking")
+    def check_max_loggin_attempt(self, ssh, expected_account_locking):
+        """ Check and configure the max failed login attempts before the
+         account is locked for specified number of sec.
+        1. Check if system-auth PAM file is updated with pam_faillock
+        2. If not, update the content of the file with pam_faillock using
+           helper function: _add_faillock_pam_configuration
+        3. Take a backup of the original pam file
+        4. Repeat the same with password-auth PAM file
+        """
+        report = {'Account Locking': []}
+        file_system_auth = "/etc/pam.d/system-auth"
+        file_password_auth = "/etc/pam.d/password-auth"
+
+        for pam_file in file_system_auth, file_password_auth:
+            current_auth = ssh.run('cat {0}'.format(pam_file))
+            if current_auth.find('pam_faillock.so') > 0:
+                msg = "File {0} already updated with pam_faillock account " \
+                      "locking configuration".format(pam_file)
+                print msg
+                report['Account Locking'].append(msg)
+                continue
+            updated_auth = self._add_faillock_pam_configuration(
+                                                current_auth,
+                                                *expected_account_locking)
+
+            ssh.run('cp {0} {0}.bkp'.format(pam_file))
+            print "\nUpdating {0} file".format(pam_file),
+            for line in updated_auth:
+                sys.stdout.write('. ')
+                sys.stdout.flush()
+                # Fixme: It will be good to have some other method to copy file
+                # Fixme: on the node, rather then copy line by line :(
+                ssh.run("echo '{0}' >> {1}.new".format(line, pam_file),
+                        populate_output=False)
+            ssh.run('mv {0}.new {0}'.format(pam_file))
+            msg = "File {0} updated with pam_faillock account " \
+                  "locking configuration".format(pam_file)
+            print '\n' + msg
+            report['Account Locking'].append(msg)
+        return report
+
+    def _add_faillock_pam_configuration(self, content, deny, unlock_time):
+        """ Helper function to update PAM files with pam_faillock
+            The pam_faillock auth lines have to placed in specific place in
+            the pam configuration files, please refer the LITP hardening doc.
+        """
+        updated_content = []
+        count = 0
+        auth1_faillock = "auth        required      pam_faillock.so preauth " \
+                         "silent audit deny={0} unlock_time={1}".format(
+            deny,
+            unlock_time
+        )
+        auth2_faillock = "auth        [default=die] pam_faillock.so " \
+                         "authfail audit deny={0} unlock_time={1}".format(
+            deny,
+            unlock_time
+        )
+
+        for line in content.splitlines():
+            if re.search('auth\s+sufficient\s+pam_unix.so', line):
+                updated_content.append(auth1_faillock)
+                updated_content.append(line)
+                updated_content.append(auth2_faillock)
+                count += 1
+                continue
+            updated_content.append(line)
+
+        if count == 1:
+            return updated_content
+        else:
+            raise StopHardeningExecution("Can't update pam.d files with "
+                                         "pam_faillock configuration changes")
+
+    @section_topic("PasswordEncryption", "grub_password_encrypted")
+    def password_encryption(self, ssh, should_be_encrypted):
+        """ Ensure that the password is encrypted or not.
+        """
+        pwd = self.description.grub_password
+        timeout_regex_str = 'timeout=[0-9]+'
+        password_line_regex_str = r'password \-\-md5 .*'
+        password_line_regex = re.compile(password_line_regex_str)
+        grub_conf = '/boot/grub/grub.conf'
+        report = ""
+
+        def is_encrypted():
+            _is_encrypted = False
+            for line in ssh.read_file(grub_conf).splitlines():
+                if password_line_regex.match(line.strip()):
+                    _is_encrypted = True
+                    break
+            return _is_encrypted
+
+        if should_be_encrypted:
+            if is_encrypted():
+                report = "Grub password is already encrypted."
+            else:
+                out = ssh.run('/sbin/grub-md5-crypt', expects=[pwd, pwd])
+                password_hash = out.splitlines()[-1]
+                new_line = "password --md5 %s" % password_hash
+                ssh.insert_line_in_file(grub_conf, new_line, timeout_regex_str)
+                report = "Grub password encrypted."
+                if not is_encrypted():
+                    raise StopHardeningExecution('Failed trying to change the '
+                                                 'file %s' % grub_conf)
+        else:
+            if is_encrypted():
+                ssh.remove_line_from_file(grub_conf, password_line_regex_str)
+                report = "Grub password was encrypted, but removed " \
+                         "from the %s file afterwards." % grub_conf
+                if is_encrypted():
+                    raise StopHardeningExecution('Failed trying to change the '
+                                                 'file %s' % grub_conf)
+            else:
+                report = "Grub password was not encrypted."
+        return report
+
+
+    @section_topic("OsConfiguration", "processes", just_report=True)
+    def os_configuration_processes(self, ssh, expected_processes):
+        """ Report the running processes and memory usage.
+        """
+        cmd = '/bin/ps -eo fname,%mem --sort -rss'
+        out = ssh.run(cmd)
+        out = '\n'.join(out.splitlines()[1:])
+        parser = TwoColumnsKeyValueSumOutputParser(out)
+        data = parser.parse()
+        return Table("Memory per process", data)
+
+    @section_topic("OsConfiguration", "running_services", just_report=True)
+    def os_configuration_running_services(self, ssh, expected_services):
+        """ Report the current services status in the system.
+        """
+        results = []
+        cmd = '/sbin/service --status-all'
+        out = ssh.run(cmd)
+        parser = ServicesStatusesParser(out)
+        all_services = parser.parse()
+        running_services = [ serv for serv in all_services if all_services[serv] ]
+        stopped_services = [ serv for serv in all_services if not all_services[serv] ]
+        results.append({"Running Services": running_services})
+        results.append({"Stopped Services": stopped_services})
+        return results
+
+    @section_topic("OsConfiguration", "known_services", just_report=True)
+    def os_configuration_known_services(self, ssh, expected_services):
+        """ Report the know services in the system.
+        """
+        cmd = '/sbin/chkconfig --list'
+        out = ssh.run(cmd)
+        splited = out.split('\n\n')
+        if len(splited) == 1:
+            out1, out2 = splited[0], ""
+        else:
+            out1, out2 = splited
+        parser = KeyValuesListOutputParser(out1)
+        results = [Table('Services', parser.parse())]
+        if out2:
+            title2 = out2.splitlines()[0]
+            out2 = '\n'.join(out2.splitlines()[1:])
+            parser = KeyValuesListOutputParser(out2)
+            results.append(Table(title2, parser.parse()))
+        return results
+
+    @section_topic("OsConfiguration", "services_ports", just_report=True)
+    def os_configuration_services_ports(self, ssh, exp_services_ports):
+        """ Report the running services and ports used.
+        """
+        cmd = '/bin/netstat -tulpn'
+        out = ssh.run(cmd)
+        parser = NetstatTulpnOutputParser(out)
+        reports = [Table(t, d, True) for t, d in parser.parse().items()]
+        return reports
+
+    @section_topic("OsConfiguration", "x_windows_used")
+    def os_configuration_x_windows_used(self, ssh, should_be_used):
+        """ Check whether X-Windows is in use or not.
+        """
+        cmd = '/sbin/pidof X'
+        try:
+            ssh.run(cmd)
+            if not should_be_used:
+                raise StopHardeningExecution('The x Window should be off '
+                                             'and it\'s on')
+        except CommandExecutionException as err:
+            if err.status_code in [1, 256]:
+                if should_be_used:
+                    raise StopHardeningExecution('The x Window should be on '
+                                                 'and it\'s off')
+            else:
+                if not should_be_used:
+                    raise StopHardeningExecution('The x Window should be off '
+                                                 'and it\'s on')
+        return {'used': should_be_used}
+
+    @section_topic("os_configuration", "system_cron_jobs", just_report=True)
+    def os_configuration_cronjobs(self, ssh, system_cron_jobs):
+        out = ssh.run('/bin/ls /etc/cron.*/*')
+        return {'Cron jobs list' :out.split()}
+
+    @section_topic("os_configuration", "cron_jobs_per_user", just_report=True)
+    def os_configuration_cron_jobs_per_user(self, ssh, cron_jobs_per_user):
+        cmd = 'for user in $(cut -f1 -d: /etc/passwd); do echo __$user; ' \
+              'crontab -u $user -l; done'
+        out = ssh.run(cmd, [1, 256])
+        parser = CrontabJobsPerUserParser(out)
+        return {'Cron jobs per user': parser.parse() or "no jobs per user."}
+
+    @section_topic("OsConfiguration", "suid_files", just_report=True)
+    def os_configuration_suid_files(self, ssh, expected_suid_files):
+        """ Ensure that no additional SUID added by LITP
+            This will generate report only.
+            We won't remove any files with SUID.
+        """
+        report = dict()
+        # Get the files with SUID set from the system
+        scaned_suid_files = set()
+        out = ssh.run('/bin/find / -perm -4000', [1, 256])
+        for line in out.splitlines():
+            if line.startswith('/bin/find: `/proc'):
+                continue
+            scaned_suid_files.add(line)
+
+        # Based on the PO decision we wil just displays files with SUID.
+
+        # # Calculate additional files with SUID set:
+        # additional_suid_files = scaned_suid_files - set(expected_suid_files)
+        # # If there are some file missing, this means we
+        # # are having wrong baseline
+        # missing_suid_files = set(expected_suid_files) - scaned_suid_files
+        #
+        # # 1 Report additional suid files, that were created unnecessary
+        # #   during LITP installation
+        # if additional_suid_files:
+        #     report['Fail: Unnecessary additional ' \
+        #            'SUID files detected'] = additional_suid_files
+        #
+        # # 2. Report missing suid files. That means the suid baseline is
+        # #    not correct anymore and have to be regenerated.
+        # if missing_suid_files:
+        #     report['Fail: Missing SUID files - the SUID files ' \
+        #            'baseline is not correct anymore'] = missing_suid_files
+        #
+        # if not additional_suid_files and not missing_suid_files:
+        #     report['SUID Success'] = "There are no additional " \
+        #                              "SUIDs files detected"
+        report['SUID files'] = list(scaned_suid_files)
+        return report
+
+    @section_topic("OsConfiguration", "sgid_files", just_report=True)
+    def os_configuration_sgid_files(self, ssh, expected_sgid_files):
+        """ Ensure that no additional SGID added by LITP
+            This will generate report only.
+            We won't remove any files with SGID.
+        """
+        report = dict()
+        # Get the files with SGID set from the system
+        scaned_sgid_files = set()
+        out = ssh.run('/bin/find / -perm -2000', [1, 256])
+        for line in out.splitlines():
+            if line.startswith('/bin/find: `/proc'):
+                continue
+            scaned_sgid_files.add(line)
+
+        # Based on the PO decision we wil just displays files with SGID.
+
+        # # Calculate additional files with SGID set:
+        # additional_sgid_files = scaned_sgid_files - set(expected_sgid_files)
+        # # If there are some file missing, this means we
+        # # are having wrong baseline
+        # missing_sgid_files = set(expected_sgid_files) - scaned_sgid_files
+        #
+        # # 1 Report additional sgid files, that were created unnecessary
+        # #   during LITP installation
+        # if additional_sgid_files:
+        #     report['Fail: Unnecessary additional ' \
+        #            'SGID files detected'] = additional_sgid_files
+        #
+        # # 2. Report missing sgid files. That means the sgid baseline is
+        # #    not correct anymore and have to be regenerated.
+        # if missing_sgid_files:
+        #     report['Fail: Missing SGID files - the SGID files ' \
+        #            'baseline is not correct anymore'] = missing_sgid_files
+        #
+        # if not additional_sgid_files and not missing_sgid_files:
+        #     report['SGID Success'] = "There are no additional " \
+        #                              "SGIDs files detected"
+        report['SGID files'] = list(scaned_sgid_files)
+        return report
+
+    @section_topic("FileSystem", "auto_mount_enabled")
+    def file_system_auto_mount_enabled(self, ssh, should_be_enabled):
+        """ Enable or disable autofs service.
+        """
+        try:
+            ssh.run('/sbin/service autofs status')
+            if should_be_enabled:
+                msg = "It was already enabled."
+            else:
+                msg = "It was enabled and stopped afterwards."
+                ssh.run('/sbin/service autofs stop')
+        except CommandExecutionException as err:
+            if should_be_enabled:
+                if err.status_code == 1:
+                    raise StopHardeningExecution("service autofs is not "
+                                                 "recognized.")
+                try:
+                    ssh.run('/sbin/service autofs start')
+                    msg = "It was disabled and started afterwards."
+                except CommandExecutionException:
+                    raise StopHardeningExecution('The package autofs should '
+                                         'be enabled but it is not installed')
+            else:
+                if err.status_code == 1:
+                    msg = "The service autofs was already disabled as it is " \
+                          "not recognized."
+                elif err.status_code == 3:
+                    msg = "The service autofs was already disabled as it is " \
+                          "not running."
+        return msg
+
+    @section_topic("FirewallConfiguration", "plugin_installed")
+    def os_configuration_firewall(self, ssh, should_be_installed):
+        is_enabled = False
+        cmd = 'rpm -qa | grep firewall'
+        cmd2 = 'litp show -p /ms/configs/fw_config_init/rules/fw_icmp'
+        out = ssh.run(cmd)
+        report = ""
+
+        for line in out.splitlines():
+            if line.startswith("ERIClitplinuxfirewall"):
+                is_enabled = True
+
+        if is_enabled and should_be_installed:
+            output = ssh.run(cmd2)
+            parser = PropertiesOutputParser(output)
+            data = parser.parse()['state']
+            is_applied = data == 'Applied'
+            if not is_applied:
+                raise StopHardeningExecution("Firewall rule not applied.")
+            else:
+                report = "Firewall rules are already applied."
+        elif is_enabled and not should_be_installed:
+            raise StopHardeningExecution("Firewall plugin is installed but it shouldn't.")
+        elif not is_enabled and should_be_installed:
+            raise StopHardeningExecution("Firewall plugin is not installed but it should be.")
+        else:
+            report = "Firewall rules are not applied."
+        return report
+
+    @section_topic("FirewallConfiguration", "tftp_port_disabled")
+    def disable_tftp_port(self, ssh, tftp_port_disabled):
+
+        def show_recursive(path):
+            return "/usr/bin/litp show -r -p %s" % path
+
+        def get_model_items(path , item_type):
+            items = []
+            out = ssh.run(show_recursive(path))
+            model_items = out.split("\n\n")
+            for model_item in model_items:
+                if ("type: %s" % item_type) in model_item and "nodes" not in model_item:
+                    items.append(model_item.strip())
+            return items
+
+        def get_parent_path_fw_config(rules, ms=False):
+            path = "cluster"
+            if ms:
+                path ="MS"
+            if not rules:
+                raise StopHardeningExecution("Configure tftp firewall plan stopped as no firewall config item exists in model under %s item-type." % path)
+            return rules[0].split()[0].rsplit('/', 1)[0]
+
+        def create_rule_cmd(path, name, port):
+            return '/usr/bin/litp create -t firewall-rule -p %s/fw_tftp -o name="%s" dport=%s' % (path, name, port)
+
+        def plan_state():
+            out = ssh.run("/usr/bin/litp show_plan | tail -n 3")
+            return out.split("\n")[2]
+
+        def wait_for_plan_success(timeout=360):
+            sec_increment = 5
+            seconds_count = sec_increment
+            while True:
+                time.sleep(sec_increment)
+                out = plan_state()
+                seconds_count += sec_increment
+                if "Failed" in out:
+                    raise StopHardeningExecution("Configure tftp firewall plan failed")
+                if "Successful" in out:
+                    return True
+                if seconds_count > timeout:
+                    raise StopHardeningExecution("Configure tftp firewall plan timeout reached")
+
+        def can_execute_plan():
+            """ Returns a tuple (True/False if a new plan can be run , plan state)
+            """
+            out = ssh.run("/usr/bin/litp show_plan | tail -n 1")
+            state = out.split()[2]
+            return (True if "Plan does not exist" in out or "Successful" in out else False, state)
+
+        ms_firewalls = get_model_items("/ms", "firewall-rule")
+        cluster_firewalls = get_model_items("/deployments", "firewall-rule")
+        cluster_fw_path = get_parent_path_fw_config(cluster_firewalls)
+        ms_fw_path = get_parent_path_fw_config(ms_firewalls, ms=True)
+
+        cluster_tftp = False
+        ms_tftp = False
+        report = dict()
+        for rule in cluster_firewalls:
+            if "tftp" in rule and rule.split()[4] == "Applied":
+                report['Tftp port Nodes'] = "Already disabled"
+                cluster_tftp = True
+                break
+
+        for rule in ms_firewalls:
+            if "tftp" in rule and rule.split()[4] == "Applied":
+                report['Tftp port MS'] = "Already disabled"
+                ms_tftp = True
+                break
+
+        can_run_new_plan, plan_state = can_execute_plan()
+        if not can_run_new_plan and not cluster_tftp or not ms_tftp:
+            raise StopHardeningExecution("Configure tftp firewall plan cannot execute as a plan already exists in state: %s" % plan_state)
+
+        can_run_new_plan, _ = can_execute_plan()
+        if not ms_tftp and can_run_new_plan:
+            cmd = create_rule_cmd(ms_fw_path, "015 tftp", 69)
+            out = ssh.run(cmd)
+
+        can_run_new_plan, _ = can_execute_plan()
+        if not cluster_tftp and can_run_new_plan:
+            cmd = create_rule_cmd(cluster_fw_path, "015 tftp", 69)
+            out = ssh.run(cmd)
+
+        can_run_new_plan, _ = can_execute_plan()
+        if (not cluster_tftp or not ms_tftp) and can_run_new_plan:
+            ssh.run("/usr/bin/litp create_plan")
+            ssh.run("/usr/bin/litp run_plan")
+            plan = wait_for_plan_success()
+            if plan:
+                report = "ftp ports disabled on MS and nodes."
+
+        return report
+
+
+    @section_topic("RoutingConfiguration", "source_routing_disabled")
+    def check_routing_configuration(self, ssh, source_routing_disabled):
+        """ Checks that source routing is enabled via sysctl commands.
+        """
+        report = {}
+        sysctl_cmd = "/sbin/sysctl -w %s=%s"
+        sysctl_params = [
+            "net.ipv4.conf.all.accept_source_route",
+            "net.ipv4.conf.all.forwarding",
+            "net.ipv6.conf.all.forwarding",
+            "net.ipv4.conf.all.mc_forwarding",
+            "net.ipv4.conf.all.accept_redirects",
+            "net.ipv6.conf.all.accept_redirects",
+            "net.ipv4.conf.all.secure_redirects",
+            "net.ipv4.conf.all.send_redirects"
+        ]
+        def grep_for_status(param):
+            return "/sbin/sysctl -a | grep %s" % param.split('.')[-1]
+
+        value = int(not source_routing_disabled)
+        status_name = lambda x: "disabled" if not x else "enabled"
+
+        for param in sysctl_params:
+            try:
+                ssh.run(sysctl_cmd % (param, value))
+                report[param] = status_name(value)
+            except CommandExecutionException:
+                output = ssh.run(grep_for_status(param))
+                failed = []
+                for line in output.splitlines():
+                    p, v = line.split(' = ')
+                    report[param] = status_name(not v)
+                    if v != str(value):
+                        failed.append(p)
+                if failed:
+                    raise StopHardeningExecution("The following Sysctl "
+                                                "parameters should be %s: %s" %
+                                       (status_name(value), ', '.join(failed)))
+        return report
+
+    @section_topic("SystemAccessControl", "login_banner_present")
+    def login_banner(self, ssh, should_be_present):
+        is_present = False
+        banner_file = '/etc/issue'
+        cmd = 'cat %s' % banner_file
+        message_to_grep = "This system is for authorised use only. " \
+                          "By using this system you consent to " \
+                          "monitoring and data collection."
+
+        message_to_cat = """###########  WARNING  ############
+
+This system is for authorised use only. By using this system you consent to monitoring and data collection.
+
+##################################
+"""
+        out = ssh.run(cmd)
+        report = ""
+
+        if message_to_grep in out:
+            is_present = True
+
+        if should_be_present and is_present:
+            report = "Correct login message is present."
+
+        elif is_present and not should_be_present:
+            ssh.run(" > %s" % banner_file)
+            report = "A login banner should not be present, cleared the file /etc/issue."
+
+        elif not is_present and should_be_present:
+            ssh.run(" > %s" % banner_file)
+            ssh.run("echo '%s' >> %s" % (message_to_cat, banner_file))
+            report = "The correct banner was not present. Cleared the /etc/issue file and added the new banner."
+
+        return report
+
+    @section_topic("SecuringServices", "telnet_installed")
+    def check_telnet_is_disabled(self, ssh, telnet_installed):
+        """
+        Remove telnet and telnet-server packages if they
+        are present on system
+        """
+        report = dict()
+        telnet_client = ['telnet']
+        telnet_server = ['telnet-server']
+        if not telnet_installed:
+            self._remove_packages(ssh, "telnet_server_installed", report, telnet_server)
+            self._remove_packages(ssh, "telnet_client_installed", report, telnet_client)
+        else:
+            raise StopHardeningExecution("telnet_installed True"
+                                         " case must be"
+                                         " implemented")
+        return report
+
+    @section_topic("SecuringServices", "ftp_installed")
+    def check_ftp_is_disabled(self, ssh, ftp_installed):
+        """
+        Remove FTP package from system if it is present
+        """
+        report = dict()
+        topic = "ftp_installed"
+        packages = ['vsftpd']
+        if not ftp_installed:
+            self._remove_packages(ssh, topic, report, packages)
+        else:
+            raise StopHardeningExecution("ftp_installed True case must be "
+                                         "implemented")
+        return report
+
+    def _remove_packages(self, ssh, topic, report, packages):
+        for package in packages:
+            try:
+                cmd = "/bin/rpm -q %s" % package
+                out = ssh.run(cmd)
+                try:
+                    cmd = '/usr/bin/yum -y remove %s' % package
+                    out = ssh.run(cmd)
+                    report[topic] = "Package %s" \
+                                    " has been remove" \
+                                    " from system." % package
+                except CommandExecutionException:
+                    raise StopHardeningExecution('Failed to remove'
+                                                 ' package "%s"'
+                                                 ' from system.'
+                                                 % package)
+            except CommandExecutionException as err:
+                if err.status_code == 1:
+                    report[topic] = "Package %s" \
+                                    " is not installed on" \
+                                    " system." % package
+
+    @section_topic("SecuringServices", "ports_not_in_use")
+    def check_ports_not_in_use(self, ssh, ports_not_in_use):
+        """
+        Kill any processes active on restricted ports
+        """
+        report = dict()
+        for port in ports_not_in_use:
+            try:
+                cmd = 'netstat -tupln | grep :%d' % port
+                out = ssh.run(cmd)
+                try:
+                    cmd = "kill $(lsof -t -i:%d)" % port
+                    out = ssh.run(cmd)
+                except CommandExecutionException:
+                    raise StopHardeningExecution("Failed to kill"
+                                                 " process on restricted "
+                                                 " port %d" % port)
+            except CommandExecutionException as err:
+                if err.status_code == 1:
+                    report['ports_not_in_use'] = "No process is active" \
+                                                 " on port %d" % port
+        return report

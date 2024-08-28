@@ -1,0 +1,154 @@
+<?xml version="1.0"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.ericsson.litp</groupId>
+        <artifactId>integration</artifactId>
+        <version>1.24.1</version>
+    </parent>
+    <groupId>com.ericsson.nms.litp</groupId>
+    <artifactId>NodeHardening</artifactId>
+    <version>1.0.1-SNAPSHOT</version>
+    <packaging>rpm</packaging>
+    <description>LITP Node Hardening configuration script</description>
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <rpm-root>/opt/ericsson</rpm-root>
+    </properties>
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <configuration>
+                            <executable>nosetests</executable>
+                            <environmentVariables>
+                                <PYTHONPATH>
+                                    ${project.basedir}/node_hardening:${env.PYTHONPATH}
+                                </PYTHONPATH>
+                            </environmentVariables>
+                            <workingDirectory>tests</workingDirectory>
+                            <arguments>
+                                <argument>--failure-detail</argument>
+                                <argument>--with-xunit</argument>
+                                <argument>--exe</argument>
+                                <argument>--verbose</argument>
+                                <argument>--with-doctest</argument>
+                                <argument>--with-cov</argument>
+                                <argument>--cov-report=term-missing</argument>
+                                <argument>--cov=node_hardening</argument>
+                                <argument>node_hardening</argument>
+                            </arguments>
+                        </configuration>
+                        <id>nosetests</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                      </execution>
+                  </executions>
+              </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>rpm-maven-plugin</artifactId>
+                <extensions>true</extensions>
+                <configuration>
+                    <needarch>x86_64</needarch>
+                    <requires>
+                        <require>python &gt;= 2.6</require>
+                    </requires>
+                    <provides>
+                        <provide>NodeHardening = 1.0.0</provide>
+                    </provides>
+                    <mappings>
+                        <mapping>
+                            <directory>${rpm-root}/node_hardening</directory>
+                            <configuration>false</configuration>
+                            <sources>
+                                <source>
+                                    <location>node_hardening/</location>
+                                    <includes>
+                                        <include>**/*.py</include>
+                                    </includes>
+                                    <excludes>
+                                        <exclude>**/*.pyc</exclude>
+                                        <exclude>**/*.pyo</exclude>
+                                        <exclude>tests</exclude>
+                                    </excludes>
+                                </source>
+                            </sources>
+
+                        </mapping>
+                    </mappings>
+                    <mappings>
+                        <mapping>
+                            <directory>${rpm-root}/node_hardening</directory>
+                            <configuration>false</configuration>
+                            <sources>
+                                <source>
+                                    <location>node_hardening/</location>
+                                    <includes>
+                                        <include>**/*.py</include>
+                                    </includes>
+                                    <excludes>
+                                        <exclude>**/*.pyc</exclude>
+                                        <exclude>**/*.pyo</exclude>
+                                    </excludes>
+                                </source>
+                            </sources>
+                        </mapping>
+                    </mappings>
+
+                    <!--
+                    <prepareScriptlet>
+                        <scriptFile></scriptFile>
+                        <fileEncoding>utf-8</fileEncoding>
+                    </prepareScriptlet>
+                    <preinstallScriptlet>
+                        <scriptFile></scriptFile>
+                        <fileEncoding>utf-8</fileEncoding>
+                    </preinstallScriptlet>
+                    <postinstallScriptlet>
+                        <scriptFile></scriptFile>
+                        <fileEncoding>utf-8</fileEncoding>
+                    </postinstallScriptlet>
+                    <preremoveScriptlet>
+                        <scriptFile></scriptFile>
+                        <fileEncoding>utf-8</fileEncoding>
+                    </preremoveScriptlet>
+                    <postremoveScriptlet>
+                        <scriptFile></scriptFile>
+                        <fileEncoding>utf-8</fileEncoding>
+                    </postremoveScriptlet>
+                    <pretransScriptlet>
+                        <scriptFile></scriptFile>
+                        <fileEncoding>utf-8</fileEncoding>
+                    </pretransScriptlet>
+                    <posttransScriptlet>
+                        <scriptFile></scriptFile>
+                        <fileEncoding>utf-8</fileEncoding>
+                    </posttransScriptlet>
+                -->
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+    <scm>
+        <developerConnection>${ericsson.scm.url}</developerConnection>
+        <tag>HEAD</tag>
+    </scm>
+
+</project>
+
+
+
+
+
+
+
+
+
+
